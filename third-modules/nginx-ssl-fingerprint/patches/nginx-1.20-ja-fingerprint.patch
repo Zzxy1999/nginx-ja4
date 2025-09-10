@@ -1,0 +1,166 @@
+--- /tmp/nginx-1.20.2/src/event/ngx_event_openssl.c	2021-11-16 22:44:02.000000000 +0800
++++ src/event/ngx_event_openssl.c	2025-09-07 02:17:58.250096607 +0800
+@@ -1741,6 +1741,27 @@
+     return NGX_OK;
+ }
+ 
++// ssl层回调
++int ngx_ssl_client_hello_jafp_func(SSL *s, int *al, void *arg) {
++    ngx_connection_t  *c = arg;
++
++    if (c == NULL) {
++        return 1;
++    }
++
++    if (c->ssl == NULL) {
++        return 1;
++    }
++
++    // 先算长度
++    c->ssl->fp_ja_data.len = SSL_client_hello_get_ja_data(c->ssl->connection, NULL);
++    // 分配空间
++    c->ssl->fp_ja_data.data = ngx_pnalloc(c->pool, c->ssl->fp_ja_data.len);
++    // 填入数据
++    c->ssl->fp_ja_data.len = SSL_client_hello_get_ja_data(c->ssl->connection, c->ssl->fp_ja_data.data);
++
++    return 1;
++}
+ 
+ ngx_int_t
+ ngx_ssl_handshake(ngx_connection_t *c)
+@@ -1761,6 +1782,8 @@
+ 
+     ngx_ssl_clear_error(c->log);
+ 
++    SSL_CTX_set_client_hello_cb(c->ssl->session_ctx, ngx_ssl_client_hello_jafp_func, c);
++
+     n = SSL_do_handshake(c->ssl->connection);
+ 
+     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0, "SSL_do_handshake: %d", n);
+--- /tmp/nginx-1.20.2/src/event/ngx_event_openssl.h	2021-11-16 22:44:02.000000000 +0800
++++ src/event/ngx_event_openssl.h	2025-09-07 02:41:05.680665940 +0800
+@@ -119,6 +119,43 @@
+     unsigned                    in_ocsp:1;
+     unsigned                    early_preread:1;
+     unsigned                    write_blocked:1;
++
++    /*
++     * 计算ja3、ja4所需要的数据，在ssl握手的时候设置
++     * 数据的结构为（由SSL_client_hello_get_ja_data填充）：
++     * uint16_t(2bytes)   version           // TLS版本号（legacy_version）
++     * uchar(1byte)     sni                 // SNI状态：'i'= IP, 'd'= 有域名
++     * 
++     * uint16_t(2bytes)   cipher_len        // 加密套件数据字节长度（实际的加密套件个数是字节数的1/2）
++     * uint16_t[]         ciphers           // 原始加密套件列表（每个套件2字节）
++     * 
++     * uint16_t(2bytes)   ext_len           // 扩展类型数据长度（实际的扩展类型个数是字节数的1/2）
++     * uint16_t[]         extensions        // 扩展类型列表（每个类型2字节，按received_order排列）
++     * 
++     * uint16_t(2bytes)   groups_len        // 支持的椭圆曲线数据长度
++     * uint16_t[]         groups            // 椭圆曲线组数据
++     * 
++     * uint8_t(1byte)     formats_len       // 椭圆曲线点格式数据长度
++     * uint16_t[]         formats           // 点格式数据
++     * 
++     * uint16_t(2bytes)   alpn_len          // ALPN协议数据长度
++     * uint16_t[]         alpn              // ALPN协议列表
++     * 
++     * uint16_t(2bytes)   sigalgs_len       // 签名算法数据长度
++     * uint16_t[]         algorithms        // 签名算法列表
++     * 
++     */
++    ngx_str_t                   fp_ja_data;
++    
++    // 下面的数据都是在使用ngx变量时计算得到的
++    // ja3的计算方法 md5(fp_ja3_str)
++    ngx_str_t                   fp_ja3_str;
++    ngx_str_t                   fp_ja3_hash;
++    // ja4的计算方法 header_sha256(cipher)_sha256(ext)
++    ngx_str_t                   fp_ja4_header;
++    ngx_str_t                   fp_ja4_cipher;
++    ngx_str_t                   fp_ja4_ext;
++    ngx_str_t                   fp_ja4_hash;
+ };
+ 
+ 
+--- /tmp/nginx-1.20.2/src/http/v2/ngx_http_v2.c	2021-11-16 22:44:02.000000000 +0800
++++ src/http/v2/ngx_http_v2.c	2025-09-08 11:28:54.409566105 +0800
+@@ -332,6 +332,14 @@
+         ngx_add_timer(rev, cscf->client_header_timeout);
+     }
+ 
++    h2c->fp_fingerprinted = 0;
++    h2c->fp_settings.data = ngx_pnalloc(c->pool, 32);
++    h2c->fp_settings.len = 0;
++    h2c->fp_priorities.data = ngx_pnalloc(c->pool, 32);
++    h2c->fp_priorities.len = 0;
++    h2c->fp_pseudoheaders.data = ngx_pnalloc(c->pool, 32);
++    h2c->fp_pseudoheaders.len = 0;
++
+     c->idle = 1;
+     ngx_reusable_connection(c, 0);
+ 
+@@ -1381,6 +1389,14 @@
+         }
+     }
+ 
++    if (!h2c->fp_fingerprinted && h2c->fp_priorities.len < 32) {
++        h2c->fp_priorities.data[h2c->fp_priorities.len] = (uint8_t)stream->node->id;
++        h2c->fp_priorities.data[h2c->fp_priorities.len + 1] = (uint8_t)excl;
++        h2c->fp_priorities.data[h2c->fp_priorities.len + 2] = (uint8_t)depend;
++        h2c->fp_priorities.data[h2c->fp_priorities.len + 3] = (uint8_t)(weight - 1);
++        h2c->fp_priorities.len += 4;
++    }
++
+     return ngx_http_v2_state_header_block(h2c, pos, end);
+ 
+ rst_stream:
+@@ -1803,6 +1819,9 @@
+     }
+ 
+     if (header->name.data[0] == ':') {
++        if (!h2c->fp_fingerprinted && h2c->fp_pseudoheaders.len < 32 && header->name.len > 1)
++            h2c->fp_pseudoheaders.data[h2c->fp_pseudoheaders.len++] = header->name.data[1];
++
+         rc = ngx_http_v2_pseudo_header(r, header);
+ 
+         if (rc == NGX_OK) {
+@@ -2226,6 +2245,12 @@
+         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, h2c->connection->log, 0,
+                        "http2 setting %ui:%ui", id, value);
+ 
++        if (!h2c->fp_fingerprinted && h2c->fp_settings.len < 32) {
++            h2c->fp_settings.data[h2c->fp_settings.len] = (uint8_t)id;
++            *(uint32_t*)(h2c->fp_settings.data + h2c->fp_settings.len + 1)  = (uint32_t)value;
++            h2c->fp_settings.len += 5;
++        }
++
+         switch (id) {
+ 
+         case NGX_HTTP_V2_INIT_WINDOW_SIZE_SETTING:
+@@ -2518,6 +2543,9 @@
+     }
+ 
+     h2c->send_window += window;
++    if (!h2c->fp_fingerprinted) {
++        h2c->fp_windowupdate = window;
++    }
+ 
+     while (!ngx_queue_empty(&h2c->waiting)) {
+         q = ngx_queue_head(&h2c->waiting);
+--- /tmp/nginx-1.20.2/src/http/v2/ngx_http_v2.h	2021-11-16 22:44:02.000000000 +0800
++++ src/http/v2/ngx_http_v2.h	2025-09-04 10:34:25.716897652 +0800
+@@ -165,6 +165,13 @@
+     unsigned                         blocked:1;
+     unsigned                         goaway:1;
+     unsigned                         push_disabled:1;
++
++    unsigned                         fp_fingerprinted:1;
++    ngx_str_t                        fp_settings;
++    ngx_uint_t                       fp_windowupdate;
++    ngx_str_t                        fp_priorities;
++    ngx_str_t                        fp_pseudoheaders;
++    ngx_str_t                        fp_str;
+ };
+ 
+ 
